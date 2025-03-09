@@ -1,0 +1,119 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+
+if not modem then
+    error("No wired modem found! Ensure a wired modem is attached.", 0)
+end
+if not monitor then
+    error("Attach a monitor!", 0)
+end
+
+rednet.open(peripheral.getName(modem))
+
+-- **Each computer must be labeled 'comp0' to 'comp7'**
+local section = tonumber(os.getComputerLabel():match("%d"))
+if section == nil or section < 0 or section > 7 then
+    error("Label computer as 'comp0', 'comp1', ..., 'comp7'", 0)
+end
+
+local fps = 10  -- 10 FPS playback
+local globalStartTime = nil
+local partNumber = 1
+local preloadedFrames = {}
+
+-- **Base URL for video files**
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shreketh/refs/heads/main/vid_"
+
+-- **Function to split a string (for parsing .nfv files)**
+local function split(inputstr, sep)
+    if inputstr == nil then return {} end
+    sep = sep or "%s"
+    local t = {}
+    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+        table.insert(t, str)
+    end
+    return t
+end
+
+-- **Download and preload a video file into memory**
+local function preloadVideoPart(part)
+    local fileURL = baseURL .. part .. "_s" .. section .. ".nfv"
+    local localPath = "/vid_" .. part .. "_s" .. section .. ".nfv"
+
+    print("Downloading:", fileURL)
+    local response = http.get(fileURL)
+    if response then
+        local file = fs.open(localPath, "w")
+        file.write(response.readAll())
+        file.close()
+        response.close()
+    else
+        print("Failed to download:", fileURL)
+        return false
+    end
+
+    preloadedFrames = {}
+    local file = fs.open(localPath, "r")
+    if file then
+        local videoData = file.readAll()
+        file.close()
+
+        local videoLines = split(videoData, "\n")
+        table.remove(videoLines, 1)  -- Remove resolution header
+
+        for i = 1, #videoLines do
+            table.insert(preloadedFrames, videoLines[i])
+        end
+    else
+        return false
+    end
+
+    return true
+end
+
+-- **Render only the assigned section**
+local function drawFast(frameIndex)
+    local width, height = monitor.getSize()
+    local section_width = width // 4
+    local section_height = height // 2
+
+    local col = section % 4
+    local row = section // 4
+
+    local startX = col * section_width + 1
+    local startY = row * section_height + 1
+
+    if preloadedFrames[frameIndex] then
+        term.setCursorPos(startX, startY)
+        term.blit(preloadedFrames[frameIndex], preloadedFrames[frameIndex], preloadedFrames[frameIndex])
+    end
+end
+
+-- **Wait for synchronization from the scheduler**
+print("Waiting for sync...")
+while true do
+    local sender, msg = rednet.receive()
+    if msg.type == "sync" then
+        globalStartTime = msg.time
+        break
+    end
+end
+
+print("Synchronized! Starting playback...")
+os.sleep((globalStartTime - os.epoch("utc")) / 1000)
+
+-- **Main loop for frame playback**
+while true do
+    local sender, msg = rednet.receive()
+    if msg.type == "frame" then
+        drawFast(msg.index)
+
+        -- **When a video part ends, delete it and preload the next part**
+        if (msg.index % 48) == 0 then  -- **Each part now has 48 frames**
+            print("Finished part", partNumber, "- deleting and downloading next part...")
+            fs.delete("/vid_" .. partNumber .. "_s" .. section .. ".nfv")  -- ✅ Delete after use
+            partNumber = partNumber + 1  -- ✅ Move to next video part
+            preloadVideoPart(partNumber)
+        end
+    end
+end
