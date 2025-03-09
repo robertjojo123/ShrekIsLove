@@ -1,0 +1,154 @@
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+
+if not modem then
+    error("No wired modem found! Ensure a wired modem is attached.", 0)
+end
+if not monitor then
+    error("Attach a monitor!", 0)
+end
+
+rednet.open(peripheral.getName(modem))
+
+-- **Each computer must be labeled 'comp0' to 'comp7'**
+local section = tonumber(os.getComputerLabel():match("%d"))
+if section == nil or section < 0 or section > 7 then
+    error("Label computer as 'comp0', 'comp1', ..., 'comp7'", 0)
+end
+
+local fps = 10  -- 10 FPS playback
+local globalStartTime = nil
+local partNumber = 1
+local nextPreloadPart = partNumber + 1  -- **Preload the next part while playing the current one.**
+local activeVideoPath = "/vid_" .. partNumber .. "_s" .. section .. ".nfv"
+local nextVideoPath = "/vid_" .. nextPreloadPart .. "_s" .. section .. ".nfv"
+local preloadedFrames = {}
+
+-- **Base URL for video files**
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/shreketh/refs/heads/main/vid_"
+
+-- **Function to split a string (for parsing .nfv files)**
+local function split(inputstr, sep)
+    if inputstr == nil then return {} end
+    sep = sep or "%s"
+    local t = {}
+    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+        table.insert(t, str)
+    end
+    return t
+end
+
+-- **Download and preload a video file into memory in the background**
+local function preloadVideoPart(part, path)
+    local fileURL = baseURL .. part .. "_s" .. section .. ".nfv"
+    
+    print("[Preloading] Downloading:", fileURL)
+    local response = http.get(fileURL)
+    if response then
+        local file = fs.open(path, "w")
+        file.write(response.readAll())
+        file.close()
+        response.close()
+        print("[Preloading] Next video part downloaded:", part)
+    else
+        print("[Preloading] Failed to download next part:", part)
+        return false
+    end
+    return true
+end
+
+-- **Loads a pre-downloaded video file into memory**
+local function loadVideoIntoMemory(path)
+    preloadedFrames = {}
+    if fs.exists(path) then
+        local file = fs.open(path, "r")
+        local videoData = file.readAll()
+        file.close()
+
+        local videoLines = split(videoData, "\n")
+        table.remove(videoLines, 1)  -- Remove resolution header
+
+        for i = 1, #videoLines do
+            table.insert(preloadedFrames, videoLines[i])
+        end
+        return true
+    else
+        return false
+    end
+end
+
+-- **Render only the assigned section**
+local function drawFast(frameIndex)
+    local width, height = monitor.getSize()
+    local section_width = width // 4
+    local section_height = height // 2
+
+    local col = section % 4
+    local row = section // 4
+
+    local startX = col * section_width + 1
+    local startY = row * section_height + 1
+
+    if preloadedFrames[frameIndex] then
+        term.setCursorPos(startX, startY)
+        term.blit(preloadedFrames[frameIndex], preloadedFrames[frameIndex], preloadedFrames[frameIndex])
+    end
+end
+
+-- **Background task to preload the next video part while rendering**
+local function backgroundPreloader()
+    while true do
+        -- **Start downloading the next video part 20 frames before the current part ends**
+        if os.epoch("utc") % 48 == 28 then
+            print("[Preloading] Starting background download for part:", nextPreloadPart)
+            preloadVideoPart(nextPreloadPart, nextVideoPath)
+        end
+        os.sleep(0.1) -- Prevent excessive CPU usage
+    end
+end
+
+-- **Wait for synchronization from the scheduler**
+print("Waiting for sync...")
+while true do
+    local sender, msg = rednet.receive()
+    if msg.type == "sync" then
+        globalStartTime = msg.time
+        break
+    end
+end
+
+print("Synchronized! Starting playback...")
+os.sleep((globalStartTime - os.epoch("utc")) / 1000)
+
+-- **Main loop for frame playback**
+local function frameRenderer()
+    while true do
+        local sender, msg = rednet.receive()
+        if msg.type == "frame" then
+            drawFast(msg.index)
+
+            -- **When a video part ends, switch to the preloaded part**
+            if (msg.index % 48) == 0 then  -- **Each part now has 48 frames**
+                print("Finished part", partNumber, "- deleting and loading next part...")
+
+                -- ✅ **Delete the old video file**
+                fs.delete(activeVideoPath)
+
+                -- ✅ **Switch to the preloaded part**
+                partNumber = nextPreloadPart
+                nextPreloadPart = partNumber + 1  -- **Set the next preload target**
+                activeVideoPath = nextVideoPath
+                nextVideoPath = "/vid_" .. nextPreloadPart .. "_s" .. section .. ".nfv"
+
+                -- ✅ **Ensure the preloaded file is ready before proceeding**
+                if not loadVideoIntoMemory(activeVideoPath) then
+                    print("[Error] Failed to load next video part! Stopping playback.")
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- **Run rendering and preloading simultaneously**
+parallel.waitForAny(frameRenderer, backgroundPreloader)
