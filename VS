@@ -1,0 +1,437 @@
+-- Optimized ComputerCraft Video Scheduler
+-- Improved sync and frame timing for reduced flickering
+
+-- Configuration
+local fps = 10  -- Target frames per second
+local expectedComputers = 8  -- Number of display computers (comp0-comp7)
+local maxParts = 100  -- Maximum number of video parts
+local framesPerPart = 48  -- Frames in each video part file
+local schedulerLabel = "scheduler"  -- Label for this computer
+
+-- Set up modem
+local modem = peripheral.find("modem")
+if not modem then
+    error("No modem attached! Please attach a wired or wireless modem.", 0)
+end
+
+-- Set computer label
+if not os.getComputerLabel() then
+    os.setComputerLabel(schedulerLabel)
+    print("[Setup] Set computer label to: " .. schedulerLabel)
+end
+
+-- Open rednet
+local modemName = peripheral.getName(modem)
+rednet.open(modemName)
+print("[Network] Rednet opened on: " .. modemName)
+
+-- State tracking
+local readyComputers = {}
+local activeComputers = 0
+local running = false
+local currentPart = 1
+local frameCount = 0
+local syncedComputers = {}
+local healthyComputers = {}
+
+-- Statistics
+local startTime = 0
+local droppedFrames = 0
+local networkMessages = 0
+local lastHealthCheck = 0
+
+-- Terminal display utilities
+local function status(message)
+    local time = textutils.formatTime(os.time(), true)
+    print("[" .. time .. "] " .. message)
+end
+
+local function clearScreen()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("===== Video Playback Scheduler =====")
+    print("FPS: " .. fps .. " | Expected Computers: " .. expectedComputers)
+    print("======================================")
+end
+
+local function updateStats()
+    term.setCursorPos(1, 8)
+    term.clearLine()
+    print("Active: " .. activeComputers .. "/" .. expectedComputers .. 
+          " | Frame: " .. frameCount .. 
+          " | Part: " .. currentPart .. 
+          " | Drop: " .. droppedFrames)
+    
+    term.setCursorPos(1, 9)
+    term.clearLine()
+    print("Runtime: " .. math.floor(os.clock() - startTime) .. "s" .. 
+          " | Msgs: " .. networkMessages ..
+          " | Healthy: " .. table.concat(healthyComputers, ","))
+end
+
+-- Process incoming messages with improved handling
+local function messageHandler()
+    while true do
+        local sender, message = rednet.receive(1) -- 1-second timeout
+        
+        if sender and message then
+            networkMessages = networkMessages + 1
+            
+            -- Handle ready messages from computers
+            if message:match("^ready_") then
+                local computerName = message:match("^ready_(.+)$")
+                if computerName and not readyComputers[computerName] then
+                    readyComputers[computerName] = true
+                    activeComputers = activeComputers + 1
+                    status("Computer " .. computerName .. " is ready. Total: " .. activeComputers .. "/" .. expectedComputers)
+                end
+            
+            -- Handle heartbeat messages for health monitoring
+            elseif message:match("^heartbeat_") then
+                local computerName = message:match("^heartbeat_(.+)$")
+                if computerName then
+                    healthyComputers[computerName] = os.clock()
+                end
+            
+            -- Handle resync requests
+            elseif message:match("^resync_request_") then
+                local computerName = message:match("^resync_request_(.+)$")
+                status("Resync requested by " .. computerName)
+                -- Broadcast current frame info to help this computer catch up
+                rednet.broadcast("frame " .. (frameCount % framesPerPart))
+            
+            -- Handle pong responses
+            elseif message:match("^pong_") then
+                local computerName = message:match("^pong_(.+)$")
+                if computerName then
+                    syncedComputers[computerName] = true
+                end
+            end
+        end
+        
+        -- Periodic health check (every 5 seconds)
+        if os.clock() - lastHealthCheck > 5 then
+            -- Check for stale heartbeats 
+            local healthString = ""
+            healthyComputers = {}
+            
+            for name, lastBeat in pairs(healthyComputers) do
+                if os.clock() - lastBeat > 10 then
+                    -- Computer hasn't sent heartbeat in 10 seconds
+                    status("Warning: Computer " .. name .. " may be unresponsive")
+                    healthyComputers[name] = nil
+                else
+                    table.insert(healthyComputers, name)
+                end
+            end
+            
+            lastHealthCheck = os.clock()
+        end
+        
+        updateStats()
+    end
+end
+
+-- Ping all computers to verify connectivity
+local function pingComputers()
+    syncedComputers = {}
+    rednet.broadcast("ping")
+    
+    local startPing = os.clock()
+    while os.clock() - startPing < 2 do
+        os.sleep(0.1)
+    end
+    
+    local responded = 0
+    for _, _ in pairs(syncedComputers) do
+        responded = responded + 1
+    end
+    
+    return responded
+end
+
+-- Display a countdown on screen
+local function countdown(seconds)
+    for i = seconds, 1, -1 do
+        term.setCursorPos(1, 7)
+        term.clearLine()
+        print("Starting playback in: " .. i .. " seconds")
+        os.sleep(1)
+    end
+    term.setCursorPos(1, 7)
+    term.clearLine()
+    print("Playback started!")
+end
+
+-- Wait for computers to connect with progress display
+local function waitForComputers(timeout)
+    status("Waiting for display computers to connect...")
+    
+    local waitTimer = os.startTimer(timeout)
+    local lastUpdate = os.clock()
+    local waitingForMsg = true
+
+    while waitingForMsg and activeComputers < expectedComputers do
+        local event, id = os.pullEvent()
+        
+        if event == "timer" and id == waitTimer then
+            waitingForMsg = false
+        end
+        
+        -- Update status every second
+        if os.clock() - lastUpdate >= 1 then
+            term.setCursorPos(1, 6)
+            term.clearLine()
+            print("Connected: " .. activeComputers .. " / " .. expectedComputers .. " computers")
+            lastUpdate = os.clock()
+            
+            -- Ping to discover any computers that didn't register
+            rednet.broadcast("ping")
+        end
+    end
+    
+    return activeComputers >= expectedComputers
+end
+
+-- Reset all connected computers
+local function resetComputers()
+    status("Resetting all connected computers...")
+    rednet.broadcast("reset 0")
+    status("Waiting for computers to reset...")
+    os.sleep(3) -- Give time for computers to reset
+    
+    -- Clear state
+    readyComputers = {}
+    activeComputers = 0
+    healthyComputers = {}
+    running = false
+    currentPart = 1
+    frameCount = 0
+    
+    -- Rediscover computers
+    rednet.broadcast("ping")
+    os.sleep(2)
+    
+    return pingComputers()
+end
+
+-- High-precision frame sync using computer clock
+local function getTimeMicros()
+    return os.epoch("utc") / 1000
+end
+
+-- Advanced timing system for frame synchronization
+local function frameSync()
+    local frameDuration = 1000000 / fps -- microseconds per frame
+    local frameStart = getTimeMicros()
+    local partFrameCount = 0
+    local lastStatsUpdate = os.clock()
+    
+    running = true
+    startTime = os.clock()
+    frameCount = 0
+    
+    -- Pre-announce the first part to all computers
+    rednet.broadcast("prepare " .. currentPart)
+    
+    -- Main playback loop
+    while running and currentPart <= maxParts do
+        -- Calculate timing for this frame
+        local currentFrameStart = getTimeMicros()
+        local targetNextFrame = frameStart + (frameCount * frameDuration)
+        
+        -- Send the frame command to all computers
+        rednet.broadcast("frame " .. (frameCount % framesPerPart) + 1)
+        
+        -- Update counters
+        frameCount = frameCount + 1
+        partFrameCount = partFrameCount + 1
+        
+        -- If we've completed a part, prepare for next part
+        if partFrameCount >= framesPerPart then
+            currentPart = currentPart + 1
+            partFrameCount = 0
+            
+            -- Pre-announce the next part with advance notice
+            rednet.broadcast("prepare " .. currentPart)
+            
+            -- Small gap between parts for smoother transition
+            os.sleep(0.2)
+        end
+        
+        -- Statistics update (only every second to avoid terminal spam)
+        if os.clock() - lastStatsUpdate > 1 then
+            updateStats()
+            lastStatsUpdate = os.clock()
+        end
+        
+        -- High-precision sleep until next frame should be shown
+        local nextFrameTime = targetNextFrame
+        local currentTime = getTimeMicros()
+        local timeToSleep = (nextFrameTime - currentTime) / 1000000 -- convert to seconds
+        
+        if timeToSleep > 0 then
+            -- Sleep until next frame time (with small adjustment for processing overhead)
+            os.sleep(timeToSleep * 0.98)
+            
+            -- Busy-wait for the final precise timing
+            while getTimeMicros() < nextFrameTime do
+                -- Spin wait for microsecond precision
+            end
+        else
+            -- We're falling behind schedule
+            droppedFrames = droppedFrames + 1
+            
+            if droppedFrames % 10 == 0 then
+                status("Warning: Dropped " .. droppedFrames .. " frames - system can't keep up with " .. fps .. " FPS")
+            end
+        end
+    end
+    
+    status("Playback complete!")
+    running = false
+end
+
+-- Display list of connected computers
+local function listConnectedComputers()
+    local list = ""
+    for name, _ in pairs(readyComputers) do
+        list = list .. name .. ", "
+    end
+    if #list > 0 then
+        list = list:sub(1, -3) -- Remove trailing comma and space
+    end
+    return list
+end
+
+-- Main menu with enhanced options
+local function showMenu()
+    while true do
+        clearScreen()
+        print("")
+        print("1. Start video playback")
+        print("2. Reset all computers")
+        print("3. Show connected computers")
+        print("4. Network diagnostics")
+        print("5. Change FPS (current: " .. fps .. ")")
+        print("6. Exit")
+        print("")
+        
+        write("Select an option: ")
+        local choice = read()
+        
+        if choice == "1" then
+            -- Check connections before starting
+            if activeComputers == 0 then
+                status("No computers connected. Waiting for connections...")
+                parallel.waitForAny(
+                    function() waitForComputers(30) end,
+                    messageHandler
+                )
+            end
+            
+            if activeComputers > 0 then
+                status("Starting playback with " .. activeComputers .. " computers")
+                
+                -- Verify all computers are responding
+                local responding = pingComputers()
+                if responding < activeComputers then
+                    status("Warning: Only " .. responding .. "/" .. activeComputers .. " computers responding!")
+                    write("Continue anyway? (y/n): ")
+                    if read():lower() ~= "y" then
+                        goto continue
+                    end
+                end
+                
+                rednet.broadcast("sync")
+                countdown(3)
+                
+                -- Run frame sync in parallel with message handler
+                parallel.waitForAny(
+                    frameSync,
+                    messageHandler
+                )
+            else
+                status("No computers connected. Cannot start playback.")
+                os.sleep(2)
+            end
+            
+        elseif choice == "2" then
+            local reset = resetComputers()
+            status("Reset complete. " .. reset .. " computers responded.")
+            os.sleep(2)
+            
+        elseif choice == "3" then
+            clearScreen()
+            print("")
+            print("Connected computers (" .. activeComputers .. "):")
+            print(listConnectedComputers())
+            print("")
+            print("Press any key to return to menu")
+            os.pullEvent("key")
+            
+        elseif choice == "4" then
+            clearScreen()
+            print("")
+            print("=== Network Diagnostics ===")
+            print("1. Ping all computers")
+            print("2. Test bandwidth")
+            print("3. Back to main menu")
+            
+            write("Select option: ")
+            local diagChoice = read()
+            
+            if diagChoice == "1" then
+                status("Pinging all computers...")
+                local responses = pingComputers()
+                status("Received " .. responses .. " responses")
+                print("Press any key to continue")
+                os.pullEvent("key")
+            elseif diagChoice == "2" then
+                status("Testing network bandwidth...")
+                local testStart = os.clock()
+                local messageCount = 0
+                
+                for i = 1, 100 do
+                    rednet.broadcast("test_" .. i)
+                    messageCount = messageCount + 1
+                end
+                
+                local elapsed = os.clock() - testStart
+                status("Sent 100 messages in " .. elapsed .. "s")
+                status("Estimated bandwidth: " .. (messageCount / elapsed) .. " msgs/sec")
+                print("Press any key to continue")
+                os.pullEvent("key")
+            end
+            
+        elseif choice == "5" then
+            write("Enter new FPS (5-20 recommended): ")
+            local newFPS = tonumber(read())
+            
+            if newFPS and newFPS > 0 and newFPS <= 60 then
+                fps = newFPS
+                status("FPS changed to " .. fps)
+            else
+                status("Invalid FPS value")
+            end
+            os.sleep(1)
+            
+        elseif choice == "6" then
+            status("Exiting scheduler...")
+            rednet.broadcast("stop") -- Tell all computers to stop
+            return
+        end
+        
+        ::continue::
+    end
+end
+
+-- Run message handler in parallel with the main menu
+parallel.waitForAny(
+    showMenu,
+    messageHandler
+)
+
+-- Clean up before exit
+rednet.close(modemName)
+print("Scheduler terminated. Thank you for using the CC Video System!"
