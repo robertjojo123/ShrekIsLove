@@ -1,0 +1,717 @@
+-- Optimized ComputerCraft Video Player
+-- Redesigned for precise frame timing and improved synchronization
+
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+
+if not modem then
+    error("No wired modem found! Ensure a wired modem is attached.", 0)
+end
+if not monitor then
+    error("Attach a monitor!", 0)
+end
+
+-- Configure monitor for optimal display
+monitor.setTextScale(0.5)
+monitor.clear()
+monitor.setTextColor(colors.white)
+monitor.setBackgroundColor(colors.black)
+
+local modemName = peripheral.getName(modem)
+if not rednet.isOpen(modemName) then
+    rednet.open(modemName)
+    print("[INFO] Rednet opened on modem: " .. modemName)
+end
+
+-- Validate computer label
+while not os.getComputerLabel() do
+    print("[ERROR] This computer has no label! Set the label using:")
+    print("    label set comp0")
+    print("    label set comp1")
+    print("    (Set one of: comp0 to comp7)")
+    os.sleep(2)
+end
+
+-- Extract the section number from the label
+local section = tonumber(os.getComputerLabel():match("%d"))
+if section == nil or section < 0 or section > 7 then
+    error("Invalid computer label! Must be 'comp0' to 'comp7'. Use 'label set compX'.", 0)
+end
+
+-- Configuration
+local fps = 10
+local partNumber = 1
+local nextPreloadPart = partNumber + 1
+local preloadedFrames = {}
+local frameBuffer = {} -- Double buffering for smoother transitions
+local playing = false
+local framesPerPart = 48
+
+-- Timing and synchronization
+local timeOffset = 0
+local lastSyncTime = 0
+local nextFrameTime = 0
+local currentFrameIndex = 1
+local frameQueue = {}
+local maxBufferedFrames = 10
+
+-- Download management
+local downloadQueue = {}
+local isDownloading = false
+local downloadHistory = {}
+
+-- Statistics and monitoring
+local missedFrames = 0
+local totalFrames = 0
+local renderTime = 0
+local lastStatsUpdate = os.clock()
+
+-- Repository details
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/ShrekIsLife/refs/heads/main/vid_"
+
+-- Display dimensions calculation
+local monitorWidth, monitorHeight = monitor.getSize()
+local sectionWidth = math.floor(monitorWidth / 4)
+local sectionHeight = math.floor(monitorHeight / 2)
+local sectionCol = section % 4
+local sectionRow = math.floor(section / 4)
+local startX = (sectionCol * sectionWidth) + 1
+local startY = (sectionRow * sectionHeight) + 1
+
+-- Function to get the video file path
+local function getVideoPath(part, sec)
+    return "/vid_" .. tostring(part) .. "_s" .. tostring(sec) .. ".nfv"
+end
+
+-- Function to split strings
+local function split(inputstr, sep)
+    if not inputstr then return {} end
+    sep = sep or "%s"
+    local t = {}
+    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+        table.insert(t, str)
+    end
+    return t
+end
+
+-- Function to get high-precision time in microseconds
+local function getTimeMicros()
+    return os.epoch("utc") / 1000
+end
+
+-- Function to get synchronized time
+local function getSyncedTimeMicros()
+    return getTimeMicros() + timeOffset
+end
+
+-- Function to queue a download
+local function queueDownload(part, path, priority)
+    -- Check if already in queue
+    for i, item in ipairs(downloadQueue) do
+        if item.part == part then
+            if priority then
+                -- Move to front of queue if priority
+                table.remove(downloadQueue, i)
+                table.insert(downloadQueue, 1, {part = part, path = path, attempts = 0})
+            end
+            return
+        end
+    end
+    
+    -- Add new item to queue
+    if priority then
+        table.insert(downloadQueue, 1, {part = part, path = path, attempts = 0})
+    else
+        table.insert(downloadQueue, {part = part, path = path, attempts = 0})
+    end
+    
+    print("[Queue] Added part " .. part .. " to download queue (" .. #downloadQueue .. " items)")
+end
+
+-- Non-blocking background downloader
+local function backgroundDownloader()
+    while true do
+        if #downloadQueue > 0 and not isDownloading then
+            isDownloading = true
+            local item = table.remove(downloadQueue, 1)
+            
+            -- Skip if file already exists
+            if fs.exists(item.path) then
+                print("[Download] File already exists: " .. item.path)
+                isDownloading = false
+                goto continue
+            end
+            
+            -- Start download in a non-blocking way
+            local fileURL = baseURL .. tostring(item.part) .. "_s" .. tostring(section) .. ".nfv"
+            print("[Downloading] Fetching: " .. fileURL .. " (Attempt " .. (item.attempts + 1) .. ")")
+            
+            -- Use http.request instead of http.get for non-blocking
+            http.request(fileURL, nil, true)
+            
+            -- Store in history for tracking
+            downloadHistory[item.part] = {
+                status = "pending",
+                url = fileURL,
+                startTime = os.clock(),
+                attempts = item.attempts + 1,
+                path = item.path
+            }
+        end
+        
+        ::continue::
+        os.sleep(0.5)
+    end
+end
+
+-- Handle download completion event
+local function downloadEventHandler()
+    while true do
+        local event, url, handle = os.pullEvent("http_success")
+        
+        -- Extract part number from URL
+        local part = url:match("vid_(%d+)_s")
+        if part then
+            part = tonumber(part)
+            local path = getVideoPath(part, section)
+            
+            print("[Download] Success for part " .. part .. " (" .. string.format("%.1f", (os.clock() - (downloadHistory[part] and downloadHistory[part].startTime or os.clock()))) .. "s)")
+            
+            -- Write file without blocking main thread
+            local file = fs.open(path, "w")
+            if file then
+                local content = handle.readAll()
+                file.write(content)
+                file.close()
+                handle.close()
+                
+                print("[Download Complete] Saved to: " .. path .. " (" .. #content .. " bytes)")
+                
+                -- Update history
+                downloadHistory[part] = {
+                    status = "complete",
+                    completedAt = os.clock(),
+                    path = path
+                }
+                
+                -- Trigger video load if this is the current or next part
+                if part == partNumber or part == nextPreloadPart then
+                    os.queueEvent("download_complete", part, path)
+                end
+            end
+        end
+        
+        isDownloading = false
+    end
+end
+
+-- Handle download failures
+local function downloadFailureHandler()
+    while true do
+        local event, url, err = os.pullEvent("http_failure")
+        
+        -- Extract part from URL
+        local part = url:match("vid_(%d+)_s")
+        if part then
+            part = tonumber(part)
+            local path = getVideoPath(part, section)
+            
+            -- Update history
+            if downloadHistory[part] then
+                downloadHistory[part].status = "failed"
+                downloadHistory[part].error = err
+            end
+            
+            print("[Download Failed] Part " .. part .. ": " .. tostring(err))
+            
+            -- Requeue with backoff based on attempts
+            local attempts = (downloadHistory[part] and downloadHistory[part].attempts or 0) + 1
+            local backoff = math.min(attempts * 2, 10) -- Exponential backoff, max 10 seconds
+            
+            -- Prioritize current part for playback continuity
+            local isPriority = (part == partNumber or part == partNumber + 1)
+            
+            print("[Retry] Requeuing part " .. part .. " with " .. backoff .. "s backoff " .. (isPriority and "(priority)" or ""))
+            os.sleep(backoff)
+            
+            -- Add back to queue with increased attempt count
+            queueDownload(part, path, isPriority)
+        end
+        
+        isDownloading = false
+    end
+end
+
+-- Optimized video frame loading with memory management
+local function loadVideoIntoMemory(path)
+    if not fs.exists(path) then
+        print("[Error] Video file not found: " .. path)
+        return false
+    end
+    
+    print("[Loading] Reading video file: " .. path)
+    local file = fs.open(path, "r")
+    if not file then
+        print("[Error] Could not open file: " .. path)
+        return false
+    end
+    
+    -- Clear existing frames to free memory
+    preloadedFrames = {}
+    collectgarbage("collect")
+    
+    -- Read resolution/header line
+    local resolutionLine = file.readLine()
+    if not resolutionLine then
+        print("[Error] Video file is empty or corrupted")
+        file.close()
+        return false
+    end
+    
+    -- Pre-allocate frame array size
+    for i = 1, framesPerPart do
+        preloadedFrames[i] = nil
+    end
+    
+    -- Read all frame data
+    local frameIndex = 1
+    local line = file.readLine()
+    while line and frameIndex <= framesPerPart do
+        preloadedFrames[frameIndex] = line
+        frameIndex = frameIndex + 1
+        line = file.readLine()
+    end
+    
+    file.close()
+    print("[Loading] Loaded " .. (frameIndex-1) .. " frames from: " .. path)
+    
+    return true
+end
+
+-- Double-buffered frame drawing for reduced flickering
+local function drawFrameBuffered(frameIndex)
+    if not preloadedFrames[frameIndex] then
+        print("[Warning] Missing frame data at index: " .. frameIndex)
+        return false
+    end
+    
+    local startRender = getTimeMicros()
+    
+    -- Prepare buffer with frame data if not already buffered
+    if not frameBuffer[frameIndex] then
+        frameBuffer[frameIndex] = preloadedFrames[frameIndex]
+    end
+    
+    -- Instant rendering directly to monitor
+    monitor.setCursorPos(startX, startY)
+    monitor.blit(frameBuffer[frameIndex], frameBuffer[frameIndex], frameBuffer[frameIndex])
+    
+    -- Track render time for performance monitoring
+    renderTime = getTimeMicros() - startRender
+    
+    return true
+end
+
+-- Initialize frame timing system
+local function initializeFrameTiming()
+    nextFrameTime = os.clock() + (1/fps)
+    currentFrameIndex = 1
+    print("[Timing] Initialized frame timing system at " .. nextFrameTime)
+end
+
+-- Message processor for improved sync
+local function messageProcessor()
+    while playing do
+        local event, sender, msg = os.pullEvent("rednet_message")
+        
+        if msg then
+            -- Parse command and value
+            local cmd, value = msg:match("^(%S+)%s+(.+)$")
+            if not cmd then
+                cmd = msg
+                value = nil
+            end
+            
+            -- Process based on command type
+            if cmd == "frame" then
+                -- Convert frame number to integer
+                local receivedFrameIndex = tonumber(value) or 0
+                
+                -- Buffer this frame
+                local frameData = preloadedFrames[receivedFrameIndex]
+                if frameData then
+                    -- Calculate when this frame should be displayed
+                    local frameOffset = (receivedFrameIndex - currentFrameIndex) / fps
+                    local targetTime = os.clock() + frameOffset
+                    
+                    -- Add to frame queue
+                    frameQueue[receivedFrameIndex] = {
+                        data = frameData,
+                        time = targetTime
+                    }
+                    
+                    -- Uncomment for debugging frame buffering
+                    -- print("[Buffer] Added frame " .. receivedFrameIndex .. " to queue for time " .. targetTime)
+                else
+                    print("[Warning] Received frame command for missing frame: " .. receivedFrameIndex)
+                end
+                
+            elseif cmd == "timesync" then
+                -- Process time synchronization
+                local serverTime = tonumber(value)
+                if serverTime then
+                    local receiveTime = getTimeMicros()
+                    local pingEstimate = 50000 -- 50ms ping assumption, could be refined
+                    
+                    -- Calculate time offset (server time minus local time plus half ping)
+                    timeOffset = serverTime - receiveTime + (pingEstimate / 2)
+                    lastSyncTime = receiveTime
+                    
+                    print("[Time] Synced with server. Offset: " .. math.floor(timeOffset/1000) .. " ms")
+                end
+                
+            elseif cmd == "prepare" then
+                -- Signal to prepare for next part
+                local nextPart = tonumber(value)
+                if nextPart and nextPart > partNumber then
+                    nextPreloadPart = nextPart
+                    print("[Scheduler] Preparing for part " .. nextPreloadPart)
+                    
+                    -- Start downloading the next part
+                    local nextPath = getVideoPath(nextPart, section)
+                    queueDownload(nextPart, nextPath, true)
+                end
+                
+            elseif cmd == "reset" then
+                print("[Command] Reset received, restarting playback")
+                
+                -- Reset state
+                frameQueue = {}
+                nextFrameTime = os.clock() + (1/fps)
+                currentFrameIndex = 1
+                
+                -- Prepare to restart
+                os.queueEvent("restart_playback")
+                
+            elseif cmd == "stop" then
+                print("[Command] Stop received, ending playback")
+                playing = false
+            end
+        end
+    end
+end
+
+-- Precise frame renderer with timing compensation
+local function preciseFrameRenderer()
+    initializeFrameTiming()
+    
+    -- Track timing statistics
+    local frameDurations = {}
+    local maxHistorySize = 10
+    local averageFrameTime = 1/fps
+    
+    while playing do
+        local currentTime = os.clock()
+        
+        -- Time to show next frame?
+        if currentTime >= nextFrameTime then
+            local frameStart = os.clock()
+            
+            -- Look for the right frame in our buffer
+            if frameQueue[currentFrameIndex] then
+                -- We have the right frame buffered, display it
+                local frameData = frameQueue[currentFrameIndex].data
+                
+                -- Draw the frame
+                monitor.setCursorPos(startX, startY)
+                monitor.blit(frameData, frameData, frameData)
+                
+                -- Increment counters
+                totalFrames = totalFrames + 1
+                
+                -- Remove from buffer and advance
+                frameQueue[currentFrameIndex] = nil
+                currentFrameIndex = currentFrameIndex + 1
+                
+                -- Record actual frame rendering duration
+                local frameDuration = os.clock() - frameStart
+                table.insert(frameDurations, frameDuration)
+                if #frameDurations > maxHistorySize then
+                    table.remove(frameDurations, 1)
+                end
+                
+                -- Calculate average frame time
+                averageFrameTime = 0
+                for _, duration in ipairs(frameDurations) do
+                    averageFrameTime = averageFrameTime + duration
+                end
+                averageFrameTime = averageFrameTime / #frameDurations
+                
+                -- Calculate next precise frame time with compensation
+                -- Subtract average render time to compensate for processing delay
+                local framePeriod = 1/fps
+                nextFrameTime = nextFrameTime + framePeriod
+                
+                -- If we've drifted too much, reset timing
+                if math.abs(nextFrameTime - (currentTime + framePeriod)) > framePeriod * 2 then
+                    print("[Timing] Resetting timing due to drift")
+                    nextFrameTime = currentTime + framePeriod
+                end
+            else
+                -- Missing frame, try to recover
+                missedFrames = missedFrames + 1
+                
+                -- Try to find next available frame
+                local nextAvailable = nil
+                for idx, _ in pairs(frameQueue) do
+                    if idx > currentFrameIndex and (not nextAvailable or idx < nextAvailable) then
+                        nextAvailable = idx
+                    end
+                end
+                
+                if nextAvailable then
+                    print("[Recovery] Skipping to next available frame: " .. nextAvailable)
+                    currentFrameIndex = nextAvailable
+                    -- Adjust timing to match the skipped frame
+                    nextFrameTime = os.clock() + (1/fps)
+                else
+                    -- No frames available, just advance time
+                    currentFrameIndex = currentFrameIndex + 1
+                    nextFrameTime = nextFrameTime + (1/fps)
+                    
+                    if missedFrames % 10 == 0 then
+                        print("[Warning] Missing frames: " .. missedFrames .. " total")
+                    end
+                end
+            end
+        end
+        
+        -- Update statistics periodically
+        if os.clock() - lastStatsUpdate > 5 then
+            print("[Stats] FPS: " .. string.format("%.1f", totalFrames / (os.clock() - lastStatsUpdate)) .. 
+                  " | Missed: " .. missedFrames .. 
+                  " | Render: " .. string.format("%.1f", averageFrameTime * 1000) .. "ms" ..
+                  " | Buffered: " .. table.maxn(frameQueue) .. " frames")
+            
+            totalFrames = 0
+            missedFrames = 0
+            lastStatsUpdate = os.clock()
+        end
+        
+        -- Small sleep to avoid CPU spinning
+        os.sleep(0.001)
+    end
+end
+
+-- Synchronization heartbeat function
+local function sendHeartbeat()
+    while playing do
+        rednet.broadcast("heartbeat_" .. os.getComputerLabel() .. "_f" .. currentFrameIndex)
+        os.sleep(1)
+    end
+end
+
+-- Video part management
+local function partManager()
+    while playing do
+        local currentVideoPath = getVideoPath(partNumber, section)
+        
+        -- Check if we need to load a new part
+        if currentFrameIndex > framesPerPart - 10 and nextPreloadPart == partNumber + 1 then
+            -- Almost finished with current part, prepare for next
+            local nextPath = getVideoPath(nextPreloadPart, section)
+            
+            if fs.exists(nextPath) then
+                print("[Transition] Pre-loading next part: " .. nextPreloadPart)
+                
+                -- Load next part in preparation
+                local nextFrames = {}
+                local nextFile = fs.open(nextPath, "r")
+                
+                if nextFile then
+                    -- Skip header
+                    nextFile.readLine()
+                    
+                    -- Read first few frames to prevent stutter
+                    for i = 1, 5 do
+                        local line = nextFile.readLine()
+                        if line then
+                            nextFrames[i] = line
+                        else
+                            break
+                        end
+                    end
+                    
+                    nextFile.close()
+                    
+                    -- Pre-buffer first frames of next part
+                    for i, data in pairs(nextFrames) do
+                        frameQueue[framesPerPart + i] = {
+                            data = data,
+                            time = os.clock() + ((framesPerPart + i - currentFrameIndex) / fps)
+                        }
+                    end
+                    
+                    print("[Transition] Pre-buffered " .. #nextFrames .. " frames from next part")
+                end
+            else
+                -- Next part not ready, request high priority download
+                print("[Transition] Next part not ready! Requesting urgent download")
+                queueDownload(nextPreloadPart, nextPath, true)
+            end
+        end
+        
+        -- Check if we need to switch to next part
+        if currentFrameIndex > framesPerPart then
+            print("[Transition] Switching from part " .. partNumber .. " to " .. nextPreloadPart)
+            
+            -- Delete old video file to save space
+            fs.delete(currentVideoPath)
+            
+            -- Advance to next part
+            partNumber = nextPreloadPart
+            nextPreloadPart = partNumber + 1
+            
+            -- Reset frame index for new part
+            currentFrameIndex = 1
+            
+            -- Load new part fully
+            loadVideoIntoMemory(getVideoPath(partNumber, section))
+            
+            -- Queue download of next part if not already done
+            local nextPath = getVideoPath(nextPreloadPart, section)
+            if not fs.exists(nextPath) then
+                queueDownload(nextPreloadPart, nextPath, false)
+            end
+            
+            -- Look ahead and prefetch second-next part
+            local nextNextPart = nextPreloadPart + 1
+            local nextNextPath = getVideoPath(nextNextPart, section)
+            if not fs.exists(nextNextPath) and df.getFreeSpace("/") > 100000 then
+                queueDownload(nextNextPart, nextNextPath, false)
+            end
+        end
+        
+        os.sleep(1)
+    end
+end
+
+-- Preload first video part
+local function initialPreload()
+    local firstVideoPath = getVideoPath(partNumber, section)
+    print("[Startup] Checking for first video part...")
+    
+    if fs.exists(firstVideoPath) then
+        print("[Startup] First video part found, loading...")
+    else
+        print("[Startup] Downloading first video part...")
+        
+        if not downloadVideo(partNumber, firstVideoPath) then
+            print("[ERROR] Failed to download initial video part. Retrying...")
+            os.sleep(2)
+            return initialPreload() -- Recursive retry
+        end
+    }
+    
+    print("[Startup] Loading first video part...")
+    if not loadVideoIntoMemory(firstVideoPath) then
+        print("[ERROR] Failed to load initial video. Check file format.")
+        fs.delete(firstVideoPath) -- Delete potentially corrupted file
+        os.sleep(1)
+        return initialPreload() -- Recursive retry
+    end
+    
+    -- Also queue next part download
+    local nextPath = getVideoPath(nextPreloadPart, section)
+    queueDownload(nextPreloadPart, nextPath, false)
+    
+    return true
+end
+
+-- Fallback download function (blocking version for critical situations)
+local function downloadVideo(part, path, maxRetries)
+    maxRetries = maxRetries or 3
+    local fileURL = baseURL .. tostring(part) .. "_s" .. tostring(section) .. ".nfv"
+    
+    for attempt = 1, maxRetries do
+        print("[Emergency Download] Fetching: " .. fileURL .. " (Attempt " .. attempt .. "/" .. maxRetries .. ")")
+        
+        local success, response = pcall(function() return http.get(fileURL, nil, true) end)
+        
+        if success and response then
+            local file = fs.open(path, "w")
+            if file then
+                file.write(response.readAll())
+                file.close()
+                response.close()
+                print("[Download Complete] Saved to: " .. path)
+                return true
+            else
+                print("[Error] Failed to write file: " .. path)
+                response.close()
+                os.sleep(1) -- Wait before retry
+            end
+        else
+            print("[Download Failed] Unable to fetch: " .. fileURL)
+            if response and type(response) == "string" then
+                print("Error: " .. response)
+            end
+            os.sleep(2) -- Longer wait for network issues
+        end
+    end
+    
+    print("[Critical] All download attempts failed for part " .. part)
+    return false
+end
+
+-- Main function
+local function main()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("=== CC:Tweaked Video Player ===")
+    print("Section: " .. section .. " (" .. sectionCol .. "," .. sectionRow .. ")")
+    print("Resolution: " .. sectionWidth .. "x" .. sectionHeight)
+    print("===============================")
+    
+    -- Preload first part
+    if not initialPreload() then
+        error("Failed to preload initial video part after multiple attempts", 0)
+    end
+    
+    -- Wait for sync from scheduler
+    print("[Waiting] For sync command...")
+    local syncReceived = false
+    rednet.broadcast("ready_" .. os.getComputerLabel())
+    
+    while not syncReceived do
+        local sender, msg = rednet.receive(nil, 5)
+        
+        if msg == "sync" then
+            print("[SYNC] Received sync from scheduler! Playback starting.")
+            playing = true
+            syncReceived = true
+        elseif msg == "ping" then
+            -- Respond to ping from scheduler
+            rednet.broadcast("pong_" .. os.getComputerLabel())
+        else
+            rednet.broadcast("ready_" .. os.getComputerLabel())
+            os.sleep(2)
+        end
+    end
+    
+    -- Run all tasks in parallel
+    parallel.waitForAll(
+        preciseFrameRenderer,  -- Displays frames at precise times
+        messageProcessor,      -- Processes network commands
+        backgroundDownloader,  -- Downloads files in background
+        downloadEventHandler,  -- Handles download completions
+        downloadFailureHandler, -- Handles download failures
+        partManager,          -- Manages video part transitions
+        sendHeartbeat         -- Sends health status
+    )
+    
+    print("[Exit] Video player terminated")
+end
+
+-- Start the player
+main()
