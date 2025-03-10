@@ -1,0 +1,626 @@
+-- Optimized ComputerCraft Video Player
+-- Enhanced with precision timing, adaptive frame rendering, and background downloading
+
+local modem = peripheral.find("modem")
+local monitor = peripheral.find("monitor")
+
+-- Forward declare functions to avoid nil errors
+local split
+local isInDownloadQueue
+local addToDownloadQueue
+local backgroundDownloader
+local loadVideoIntoMemory
+local drawFrameBuffered
+local synchronizeTime
+local getSyncedTime
+local sendHeartbeat
+local frameBufferManager
+local backgroundPreloader
+local initialPreload
+local frameRenderer
+local getVideoPath
+local getTimeMicros
+local safeCollectGarbage -- Safe garbage collection function
+
+-- Safe garbage collection function that works in ComputerCraft
+safeCollectGarbage = function()
+    if collectgarbage and type(collectgarbage) == "function" then
+        pcall(function() collectgarbage("collect") end)
+    end
+end
+
+if not modem then
+    error("No wired modem found! Ensure a wired modem is attached.", 0)
+end
+if not monitor then
+    error("Attach a monitor!", 0)
+end
+
+-- Configure monitor for optimal display
+monitor.clear()
+monitor.setTextColor(colors.white)
+monitor.setBackgroundColor(colors.black)
+
+local modemName = peripheral.getName(modem)
+if not rednet.isOpen(modemName) then
+    rednet.open(modemName)
+    print("[INFO] Rednet opened on modem: " .. modemName)
+end
+
+-- Validate computer label
+while not os.getComputerLabel() do
+    print("[ERROR] This computer has no label! Set the label using:")
+    print("    label set comp0")
+    print("    label set comp1")
+    print("    (Set one of: comp0 to comp7)")
+    os.sleep(2)
+end
+
+-- Extract the section number from the label
+local section = tonumber(os.getComputerLabel():match("%d"))
+if section == nil or section < 0 or section > 7 then
+    error("Invalid computer label! Must be 'comp0' to 'comp7'. Use 'label set compX'.", 0)
+end
+
+-- Configuration
+local fps = 10
+local partNumber = 1
+local nextPreloadPart = partNumber + 1
+local preloadedFrames = {}
+local frameBuffer = {} -- Double buffering for smoother transitions
+local frameTimings = {} -- Store when each frame should play
+local lastFrameTime = 0
+local frameInterval = 1 / fps -- seconds between frames
+local playing = false
+local framesPerPart = 48
+local timeOffset = 0 -- Time synchronization offset
+local frameIndex = 1
+local maxFrameAhead = 10 -- Number of frames to buffer ahead
+local downloadQueue = {} -- Queue for background downloads
+local missedFrames = 0
+
+-- Repository details
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/ShrekIsLife/refs/heads/main/vid_"
+
+-- Display dimensions calculation
+local monitorWidth, monitorHeight = monitor.getSize()
+local sectionWidth = math.floor(monitorWidth / 4)
+local sectionHeight = math.floor(monitorHeight / 2)
+local sectionCol = section % 4
+local sectionRow = math.floor(section / 4)
+local startX = (sectionCol * sectionWidth) + 1
+local startY = (sectionRow * sectionHeight) + 1
+
+-- Precise timing function
+getTimeMicros = function()
+    return os.epoch("utc") / 1000
+end
+
+-- Function to get the video file path
+getVideoPath = function(part, sec)
+    return "/vid_" .. tostring(part) .. "_s" .. tostring(sec) .. ".nfv"
+end
+
+-- Function to split strings
+split = function(inputstr, sep)
+    if not inputstr then return {} end
+    sep = sep or "%s"
+    local t = {}
+    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+        table.insert(t, str)
+    end
+    return t
+end
+
+-- Helper function to check if a part is in download queue
+isInDownloadQueue = function(part)
+    for _, download in ipairs(downloadQueue) do
+        if download.part == part then
+            return true
+        end
+    end
+    return false
+end
+
+-- Non-blocking background download system
+addToDownloadQueue = function(part, path)
+    table.insert(downloadQueue, {part = part, path = path, attempts = 0, status = "queued"})
+    print("[Download] Added to queue: Part " .. part)
+end
+
+-- Background download processor
+backgroundDownloader = function()
+    while true do
+        if #downloadQueue > 0 then
+            local download = downloadQueue[1]
+            table.remove(downloadQueue, 1)
+            
+            -- Process this download
+            download.status = "downloading"
+            download.attempts = download.attempts + 1
+            
+            local fileURL = baseURL .. tostring(download.part) .. "_s" .. tostring(section) .. ".nfv"
+            print("[Downloading] Fetching: " .. fileURL .. " (Attempt " .. download.attempts .. "/3)")
+            
+            local success, response = pcall(function() return http.get(fileURL, nil, true) end)
+            
+            if success and response then
+                local file = fs.open(download.path, "w")
+                if file then
+                    file.write(response.readAll())
+                    file.close()
+                    response.close()
+                    print("[Download Complete] Saved to: " .. download.path)
+                    download.status = "complete"
+                else
+                    print("[Error] Failed to write file: " .. download.path)
+                    response.close()
+                    
+                    -- Requeue if under max attempts
+                    if download.attempts < 3 then
+                        download.status = "queued"
+                        table.insert(downloadQueue, download)
+                    else
+                        download.status = "failed"
+                    end
+                end
+            else
+                print("[Download Failed] Unable to fetch: " .. fileURL)
+                
+                -- Requeue if under max attempts
+                if download.attempts < 3 then
+                    download.status = "queued"
+                    table.insert(downloadQueue, download)
+                else
+                    download.status = "failed"
+                end
+            end
+        end
+        
+        os.sleep(0.1) -- Short sleep to prevent CPU spinning
+    end
+end
+
+-- Optimized video frame loading
+loadVideoIntoMemory = function(path)
+    if not fs.exists(path) then
+        print("[Error] Video file not found: " .. path)
+        return false
+    end
+    
+    print("[Loading] Reading video file: " .. path)
+    local file = fs.open(path, "r")
+    if not file then
+        print("[Error] Could not open file: " .. path)
+        return false
+    end
+    
+    -- Clear existing frames to free memory
+    preloadedFrames = {}
+    safeCollectGarbage() -- Using our safe garbage collection function
+    
+    -- Read resolution/header line
+    local resolutionLine = file.readLine()
+    if not resolutionLine then
+        print("[Error] Video file is empty or corrupted")
+        file.close()
+        return false
+    end
+    
+    -- Pre-allocate frame array size
+    for i = 1, framesPerPart do
+        preloadedFrames[i] = nil
+    end
+    
+    -- Read all frame data
+    local frameIndex = 1
+    local line = file.readLine()
+    while line and frameIndex <= framesPerPart do
+        preloadedFrames[frameIndex] = line
+        frameIndex = frameIndex + 1
+        line = file.readLine()
+    end
+    
+    file.close()
+    print("[Loading] Loaded " .. (frameIndex-1) .. " frames from: " .. path)
+    
+    return true
+end
+
+-- Double-buffered frame drawing for reduced flickering
+drawFrameBuffered = function(frameIndex)
+    if not preloadedFrames[frameIndex] then
+        print("[Warning] Missing frame data at index: " .. frameIndex)
+        return false
+    end
+    
+    -- Prepare buffer with frame data
+    if not frameBuffer[frameIndex] then
+        frameBuffer[frameIndex] = preloadedFrames[frameIndex]
+    end
+    
+    -- Instant rendering directly to monitor
+    monitor.setCursorPos(startX, startY)
+    monitor.blit(frameBuffer[frameIndex], frameBuffer[frameIndex], frameBuffer[frameIndex])
+    
+    return true
+end
+
+-- Time synchronization with scheduler
+synchronizeTime = function()
+    local syncStartTime = getTimeMicros()
+    rednet.broadcast("time_sync_request_" .. os.getComputerLabel())
+    
+    local event, sender, message
+    local timeout = os.startTimer(3)
+    local received = false
+    
+    while not received do
+        event, sender, message = os.pullEvent()
+        
+        if event == "rednet_message" and message and message:match("^time_sync_response ") then
+            local serverTime = tonumber(message:match("^time_sync_response (%d+)"))
+            if serverTime then
+                local roundTripTime = (getTimeMicros() - syncStartTime) / 2
+                timeOffset = serverTime - (syncStartTime + roundTripTime)
+                print("[Time Sync] Offset: " .. timeOffset .. " microseconds")
+                received = true
+            end
+        elseif event == "timer" and sender == timeout then
+            print("[Time Sync] Timeout waiting for sync response")
+            break
+        end
+    end
+    
+    return received
+end
+
+-- Get synchronized time
+getSyncedTime = function()
+    return getTimeMicros() + timeOffset
+end
+
+-- Synchronization heartbeat function
+sendHeartbeat = function()
+    while playing do
+        rednet.broadcast("heartbeat_" .. os.getComputerLabel())
+        os.sleep(1)
+    end
+end
+
+-- Proactive frame buffer management
+frameBufferManager = function()
+    local lastFrameScheduled = 0
+    
+    while playing do
+        -- Only buffer frames if we have loaded video data
+        if #preloadedFrames > 0 then
+            local currentFrame = frameIndex
+            
+            -- Pre-buffer frames ahead
+            for i = 1, maxFrameAhead do
+                local bufferFrame = currentFrame + i
+                if bufferFrame <= #preloadedFrames and not frameTimings[bufferFrame] then
+                    -- Calculate when this frame should play
+                    local frameTime = lastFrameTime + (i * frameInterval)
+                    frameTimings[bufferFrame] = frameTime
+                    lastFrameScheduled = bufferFrame
+                end
+            end
+        end
+        
+        os.sleep(0.1)
+    end
+end
+
+-- Background preloader task with aggressive prefetching
+backgroundPreloader = function()
+    while true do
+        if playing then
+            -- Preload next part if not already done
+            local nextVideoPath = getVideoPath(nextPreloadPart, section)
+            if not fs.exists(nextVideoPath) and not isInDownloadQueue(nextPreloadPart) then
+                print("[Preloading] Starting download for part " .. nextPreloadPart)
+                addToDownloadQueue(nextPreloadPart, nextVideoPath)
+            end
+            
+            -- Look ahead and prefetch second-next part too (if disk space allows)
+            local nextNextPart = nextPreloadPart + 1
+            local nextNextPath = getVideoPath(nextNextPart, section)
+            
+            -- Safe disk space checking with error handling
+            local freeSpace = 0
+            local success, result = pcall(function()
+                if df and df.getFreeSpace then
+                    return df.getFreeSpace("/")
+                else
+                    return fs.getFreeSpace("/")  -- Fallback to standard API
+                end
+            end)
+            
+            if success then
+                freeSpace = result
+            else
+                -- Default to a conservative estimate if function failed
+                freeSpace = 150000
+            end
+            
+            if not fs.exists(nextNextPath) and not isInDownloadQueue(nextNextPart) and freeSpace > 100000 then
+                print("[Pre-prefetching] Starting early download for part " .. nextNextPart)
+                addToDownloadQueue(nextNextPart, nextNextPath)
+            end
+        end
+        os.sleep(2)
+    end
+end
+
+-- Preload first video part
+initialPreload = function()
+    local firstVideoPath = getVideoPath(partNumber, section)
+    print("[Startup] Downloading first video part...")
+    
+    fs.delete(firstVideoPath) -- Remove any old file
+    addToDownloadQueue(partNumber, firstVideoPath)
+    
+    -- Wait for download to complete
+    while not fs.exists(firstVideoPath) do
+        print("[Startup] Waiting for initial download...")
+        os.sleep(1)
+    end
+    
+    print("[Startup] Loading first video part...")
+    if not loadVideoIntoMemory(firstVideoPath) then
+        print("[ERROR] Failed to load initial video. Check file format.")
+        fs.delete(firstVideoPath) -- Delete potentially corrupted file
+        os.sleep(1)
+        return initialPreload() -- Recursive retry
+    end
+    
+    return true
+end
+
+-- Decoupled frame rendering system
+frameRenderer = function()
+    local frameTimeout = 10 -- seconds to wait
+    local nextFrameTime = os.clock() + frameInterval
+    local successFrames = 0
+    local totalFrames = 0
+    local adaptiveAdjustment = 0
+    local adjustmentHistory = {}
+    local maxAdjustmentHistory = 10
+    
+    while playing do
+        local currentVideoPath = getVideoPath(partNumber, section)
+        local continueOuter = false
+        
+        -- Wait for file to exist and load it
+        if not fs.exists(currentVideoPath) then
+            print("[Waiting] Current video file not ready: " .. currentVideoPath)
+            repeat
+                os.sleep(0.5)
+            until fs.exists(currentVideoPath) or not playing
+            
+            if not playing then break end
+        end
+        
+        -- Load video data if needed
+        if #preloadedFrames == 0 then
+            if not loadVideoIntoMemory(currentVideoPath) then
+                print("[Critical] Failed to load video after file exists. Retrying...")
+                fs.delete(currentVideoPath)
+                addToDownloadQueue(partNumber, currentVideoPath)
+                os.sleep(1)
+                continueOuter = true
+            end
+        end
+        
+        if continueOuter then
+            -- Skip the rest of this iteration and continue with the next
+        else
+            -- Play video frames with tight synchronization
+            print("[Playing] Video part " .. partNumber .. " with " .. #preloadedFrames .. " frames")
+            frameIndex = 1
+            local maxFrames = #preloadedFrames
+            
+            -- Pre-cache frame buffer to reduce first-frame delay
+            for i = 1, math.min(5, maxFrames) do
+                frameBuffer[i] = preloadedFrames[i]
+            end
+            
+            -- Initial frame timing setup
+            lastFrameTime = os.clock()
+            for i = 1, maxFrameAhead do
+                if i <= maxFrames then
+                    frameTimings[i] = lastFrameTime + ((i-1) * frameInterval)
+                end
+            end
+            
+            while frameIndex <= maxFrames and playing do
+                -- Process any network events (non-blocking)
+                local event, param1, param2, param3 = os.pullEvent("rednet_message")
+                
+                if event == "rednet_message" then
+                    local sender, msg = param1, param2
+                    
+                    if msg then
+                        local cmd, value = msg:match("^(%S+)%s+(%d+)$")
+                        
+                        if cmd == "frame" then
+                            -- We'll use this for sync verification
+                            local receivedFrameIndex = tonumber(value) or 0
+                            
+                            -- Calculate frame diff for adaptive correction
+                            local frameDiff = receivedFrameIndex - frameIndex
+                            if frameDiff ~= 0 and math.abs(frameDiff) < 10 then
+                                -- Add to adjustment history
+                                table.insert(adjustmentHistory, frameDiff)
+                                if #adjustmentHistory > maxAdjustmentHistory then
+                                    table.remove(adjustmentHistory, 1)
+                                end
+                                
+                                -- Calculate average adjustment
+                                local sum = 0
+                                for _, adj in ipairs(adjustmentHistory) do
+                                    sum = sum + adj
+                                end
+                                adaptiveAdjustment = sum / #adjustmentHistory
+                                
+                                -- Strong sync correction if we're significantly off
+                                if math.abs(frameDiff) > 3 then
+                                    print("[Sync] Correcting from frame " .. frameIndex .. " to " .. receivedFrameIndex)
+                                    frameIndex = receivedFrameIndex
+                                end
+                            end
+                        elseif cmd == "prepare" then
+                            -- Signal to prepare for the next part
+                            local nextPart = tonumber(value)
+                            if nextPart and nextPart > partNumber then
+                                nextPreloadPart = nextPart
+                                print("[Scheduler] Preparing for part " .. nextPreloadPart)
+                            end
+                        elseif cmd == "reset" then
+                            print("[Command] Reset received, restarting playback")
+                            break
+                        elseif cmd == "stop" then
+                            print("[Command] Stop received, ending playback")
+                            playing = false
+                            break
+                        elseif cmd == "time_sync_response" then
+                            -- Time sync response received
+                            local serverTime = tonumber(value)
+                            if serverTime then
+                                local currentTime = getTimeMicros()
+                                timeOffset = serverTime - currentTime
+                                print("[Time] Sync offset updated: " .. timeOffset)
+                            end
+                        end
+                    end
+                end
+                
+                -- Check if it's time to render the next frame
+                local currentTime = os.clock()
+                if currentTime >= nextFrameTime then
+                    -- Apply adaptive timing adjustment 
+                    local adaptiveInterval = frameInterval * (1 + (adaptiveAdjustment * 0.1))
+                    
+                    if drawFrameBuffered(frameIndex) then
+                        -- Frame rendered successfully
+                        lastFrameTime = currentTime
+                        successFrames = successFrames + 1
+                        
+                        -- Calculate render time and adjust next frame time
+                        local actualFrameTime = currentTime - lastFrameTime
+                        local adjustment = adaptiveInterval - actualFrameTime
+                        nextFrameTime = currentTime + adaptiveInterval + (adjustment * 0.5)
+                        
+                        frameIndex = frameIndex + 1
+                        missedFrames = 0 -- Reset missed frame counter on success
+                    else
+                        -- Frame missing
+                        missedFrames = missedFrames + 1
+                        nextFrameTime = currentTime + adaptiveInterval
+                        
+                        if missedFrames > 5 then
+                            print("[Sync] Requesting resync after " .. missedFrames .. " missed frames")
+                            rednet.broadcast("resync_request_" .. os.getComputerLabel())
+                        end
+                    end
+                    
+                    -- End this part if we've shown all frames
+                    if frameIndex > maxFrames then
+                        break
+                    end
+                end
+                
+                -- Short sleep to avoid CPU spinning
+                os.sleep(0.001)
+            end
+        end
+        
+        -- Clean up memory before switching parts
+        print("[Transition] Completed part " .. partNumber .. ", preparing for next part")
+        
+        -- Delete old video file only after confirming next part exists
+        local nextPath = getVideoPath(nextPreloadPart, section)
+        local deleteOld = true
+        
+        if not fs.exists(nextPath) then
+            print("[Warning] Next video part not ready yet. Keeping current part as backup.")
+            deleteOld = false
+            
+            -- Force download of next part
+            addToDownloadQueue(nextPreloadPart, nextPath)
+        end
+        
+        -- Only delete if safe to do so
+        if deleteOld then
+            fs.delete(getVideoPath(partNumber, section))
+        end
+        
+        -- Advance to next part
+        partNumber = nextPreloadPart
+        nextPreloadPart = partNumber + 1
+        preloadedFrames = {} -- Clear memory
+        frameTimings = {} -- Clear timings
+        frameBuffer = {} -- Clear buffer
+        safeCollectGarbage() -- Using our safe garbage collection function
+    end
+end
+
+-- Main function
+local function main()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("=== CC:Tweaked Video Player ===")
+    print("Section: " .. section .. " (" .. sectionCol .. "," .. sectionRow .. ")")
+    print("Resolution: " .. sectionWidth .. "x" .. sectionHeight)
+    print("===============================")
+    
+    -- Start background downloader first
+    parallel.waitForAny(
+        function()
+            -- Wait for sync from scheduler
+            print("[Waiting] For sync command...")
+            local syncReceived = false
+            rednet.broadcast("ready_" .. os.getComputerLabel())
+            
+            while not syncReceived do
+                local sender, msg = rednet.receive(nil, 5)
+                
+                if msg == "sync" then
+                    print("[SYNC] Received sync from scheduler! Playback starting.")
+                    playing = true
+                    syncReceived = true
+                    
+                    -- Perform time synchronization
+                    synchronizeTime()
+                elseif msg == "ping" then
+                    -- Respond to ping from scheduler
+                    rednet.broadcast("pong_" .. os.getComputerLabel())
+                else
+                    rednet.broadcast("ready_" .. os.getComputerLabel())
+                    os.sleep(2)
+                end
+            end
+            
+            -- Start preloading
+            if not initialPreload() then
+                error("Failed to preload initial video part after multiple attempts", 0)
+            end
+            
+            -- Run all tasks in parallel
+            parallel.waitForAll(
+                frameRenderer,
+                backgroundPreloader,
+                sendHeartbeat,
+                frameBufferManager
+            )
+        end,
+        backgroundDownloader
+    )
+    
+    print("[Exit] Video player terminated")
+end
+
+-- Start the player
+main()
